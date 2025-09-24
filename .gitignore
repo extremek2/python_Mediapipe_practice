@@ -1,0 +1,7 @@
+gesture_recognizer/
+data/
+.venv/
+.idea
+.vscode
+.vs
+__pyche__
