@@ -4,4 +4,4 @@ data/
 .idea
 .vscode
 .vs
-__pyche__
+__pycache__

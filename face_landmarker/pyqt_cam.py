@@ -3,7 +3,7 @@ import os
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QLabel, QWidget, QHBoxLayout,
-                             QVBoxLayout, QPushButton, QSlider, QMainWindow)
+                             QVBoxLayout, QPushButton, QSlider, QMainWindow, QFrame)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QImage, QPixmap
 from datetime import datetime
@@ -20,7 +20,6 @@ os.makedirs(CAPTURE_FOLDER, exist_ok=True)
 # Helper functions
 # ---------------------------
 def detect_smile(blendshapes):
-    """블렌드셰이프에서 웃음 점수 계산"""
     smile_score = 0.0
     smile_related = [
         'mouthSmileLeft', 'mouthSmileRight',
@@ -33,14 +32,12 @@ def detect_smile(blendshapes):
     return smile_score / len(smile_related) if smile_related else 0.0
 
 def save_smile_photo(frame, smile_score):
-    """웃음 사진 저장"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{CAPTURE_FOLDER}/smile_{timestamp}_score_{smile_score:.2f}.jpg"
+    filename = f"{CAPTURE_FOLDER}/smile_{timestamp}_score_{int(smile_score*100)}.jpg"
     cv2.imwrite(filename, frame)
     return filename
 
 def draw_landmarks_on_image(frame, result):
-    """랜드마크 표시"""
     annotated = frame.copy()
     for lm in result.face_landmarks[0].landmark:
         x, y = int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])
@@ -52,7 +49,7 @@ def draw_landmarks_on_image(frame, result):
 # ---------------------------
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
-    captured_signal = pyqtSignal(str)
+    captured_signal = pyqtSignal(object, float)  # (frame_or_filepath, score)
 
     def __init__(self, detector):
         super().__init__()
@@ -62,6 +59,7 @@ class VideoThread(QThread):
         self.CAPTURE_COOLDOWN = 2
         self.last_capture_time = 0
         self.show_landmarks = False
+        self.auto_save = True
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -81,42 +79,39 @@ class VideoThread(QThread):
 
             try:
                 result = self.detector.detect(mp_image)
+                display_frame = frame.copy()
+
                 if result.face_landmarks and result.face_blendshapes:
                     blendshapes = result.face_blendshapes[0]
                     smile_score = detect_smile(blendshapes)
                     smile_detected = smile_score > self.SMILE_THRESHOLD
 
-                    current_time = time.time()
-                    display_frame = frame.copy()
                     if self.show_landmarks:
                         display_frame = draw_landmarks_on_image(display_frame, result)
 
-                    # 자동 캡처
+                    current_time = time.time()
                     if smile_detected and (current_time - self.last_capture_time) > self.CAPTURE_COOLDOWN:
-                        filename = save_smile_photo(display_frame, smile_score)
-                        self.captured_signal.emit(filename)
+                        if self.auto_save:
+                            filename = save_smile_photo(display_frame, smile_score)
+                            self.captured_signal.emit(filename, smile_score)
+                        else:
+                            self.captured_signal.emit(display_frame, smile_score)
                         self.last_capture_time = current_time
 
-                else:
-                    display_frame = frame.copy()
+                # 진행도 바 표시
+                bar_w, bar_h = 300, 20
+                cv2.rectangle(display_frame, (10,10), (10+bar_w,10+bar_h), (50,50,50), -1)
+                prog = int(bar_w * min(smile_score,1.0))
+                color = (0,255,0) if smile_detected else (0,255,255)
+                cv2.rectangle(display_frame, (10,10), (10+prog,10+bar_h), color, -1)
+                thresh_x = int(10 + bar_w*self.SMILE_THRESHOLD)
+                cv2.line(display_frame, (thresh_x,10), (thresh_x,10+bar_h), (0,0,255), 2)
+                col = (0,255,0) if smile_detected else (0,0,255)
+                cv2.putText(display_frame, f"Smile: {int(smile_score*100)}%", (10,45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
 
             except Exception as e:
                 display_frame = frame.copy()
-
-            # 진행도 바
-            bar_width, bar_height = 300, 20
-            bar_x, bar_y = 10, 10
-            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+bar_width, bar_y+bar_height), (50,50,50), -1)
-            progress_width = int(bar_width * min(smile_score / 1.0, 1.0))
-            bar_color = (0,255,0) if smile_detected else (0,255,255)
-            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x+progress_width, bar_y+bar_height), bar_color, -1)
-            threshold_x = int(bar_x + bar_width * self.SMILE_THRESHOLD)
-            cv2.line(display_frame, (threshold_x, bar_y), (threshold_x, bar_y+bar_height), (0,0,255), 2)
-
-            # 웃음 점수 표시
-            color = (0,255,0) if smile_detected else (0,0,255)
-            cv2.putText(display_frame, f"Smile Score: {smile_score:.2f}", (10, bar_y+40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             self.change_pixmap_signal.emit(display_frame)
 
@@ -132,44 +127,104 @@ class VideoThread(QThread):
 class SmileDetectionApp(QMainWindow):
     def __init__(self, detector):
         super().__init__()
+        # QMainWindow 초기화
         self.setWindowTitle("Smile Detection App")
+
+        # 캠, 프리뷰 사이즈
+        cam_width, cam_height = 640, 480
+        preview_width, preview_height = 640, 480
+
+        # 레이아웃 여백 고려 (간단히 padding 20px 정도)
+        padding = 20
+
+        window_width = cam_width + preview_width + padding
+        window_height = max(cam_height, preview_height) + padding
+
+        self.resize(window_width, window_height)
+
         self.detector = detector
 
-        # 중앙 위젯 & 레이아웃
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QHBoxLayout()
-        central_widget.setLayout(layout)
+        self.pending_frame = None
+        self.pending_score = None
 
-        # 왼쪽: 실시간 영상
-        left_layout = QVBoxLayout()
+
+        # ----------------------
+        # 왼쪽 프레임 (캠)
+        # ----------------------
+        left_frame = QFrame()
+        left_frame.setFrameShape(QFrame.Box)  # 경계선
+        left_layout = QVBoxLayout(left_frame)
+
+        # 왼쪽 상단 고정 레이블
+        self.lbl_camera = QLabel("실시간 영상")
+        self.lbl_camera.setAlignment(Qt.AlignLeft)
+        left_layout.addWidget(self.lbl_camera)
+
+        # 왼쪽 중앙: 카메라 프레임
         self.video_label = QLabel()
-        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setAlignment(Qt.AlignLeft)
         left_layout.addWidget(self.video_label)
 
-        # 컨트롤 버튼
-        self.btn_capture = QPushButton("Manual Capture")
-        self.btn_capture.clicked.connect(self.manual_capture)
-        left_layout.addWidget(self.btn_capture)
+        # 슬라이더 레이블
+        self.lbl_threshold = QLabel("웃음 강도 조절")
+        left_layout.addWidget(self.lbl_threshold)
 
-        self.btn_landmark = QPushButton("Toggle Landmarks")
-        self.btn_landmark.clicked.connect(self.toggle_landmarks)
-        left_layout.addWidget(self.btn_landmark)
+        # 슬라이더
+        self.slider_thresh = QSlider(Qt.Horizontal)
+        self.slider_thresh.setRange(1,100)
+        self.slider_thresh.setValue(int(0.2*100))
+        self.slider_thresh.valueChanged.connect(self.update_threshold)
+        left_layout.addWidget(self.slider_thresh)
 
-        self.slider_threshold = QSlider(Qt.Horizontal)
-        self.slider_threshold.setRange(1, 100)
-        self.slider_threshold.setValue(int(0.2*100))
-        self.slider_threshold.valueChanged.connect(self.update_threshold)
-        left_layout.addWidget(self.slider_threshold)
 
-        layout.addLayout(left_layout)
+        # ----------------------
+        # 오른쪽 프레임 (프리뷰)
+        # ----------------------
 
-        # 오른쪽: 마지막 캡처 사진
-        right_layout = QVBoxLayout()
-        self.capture_label = QLabel()
+        # 오른쪽 프레임 초기화
+        right_frame = QFrame()
+        right_frame.setFrameShape(QFrame.Box)  # 경계선
+        right_frame.setFixedSize(640, 480)
+        right_layout = QVBoxLayout(right_frame)
+
+        # 오른쪽 고정 레이블
+        self.preview_label = QLabel("최신 웃음 사진")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        right_layout.addWidget(self.preview_label)
+
+        # 오른쪽: 캡처 프리뷰
+        self.capture_label = QLabel("No preview")
         self.capture_label.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(self.capture_label)
-        layout.addLayout(right_layout)
+
+        # 오른쪽: 저장 버튼 (자동 저장 모드 OFF 시 활성화)
+        self.btn_save = QPushButton("저장")
+        self.btn_save.clicked.connect(self.save_preview)
+        self.btn_save.setVisible(False)
+        right_layout.addWidget(self.btn_save)
+
+        # 오른쪽: 취소 버튼 (자동 저장 모드 OFF 시 활성화)
+        self.btn_cancel = QPushButton("취소")
+        self.btn_cancel.clicked.connect(self.cancel_preview)
+        self.btn_cancel.setVisible(False)
+        right_layout.addWidget(self.btn_cancel)
+
+        # 오른쪽: 자동 저장 모드 (ON/OFF)
+        self.btn_auto = QPushButton("자동 저장 모드: ON")
+        self.btn_auto.clicked.connect(self.toggle_auto_save)
+        right_layout.addWidget(self.btn_auto)
+
+
+        # ----------------------
+        # 메인 레이아웃
+        # ----------------------
+        main_layout = QHBoxLayout()
+        main_layout.addWidget(left_frame)
+        main_layout.addWidget(right_frame)
+
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
 
         # 비디오 스레드 시작
         self.thread = VideoThread(detector)
@@ -185,18 +240,54 @@ class SmileDetectionApp(QMainWindow):
         qimg = self.convert_cv_qt(frame)
         self.video_label.setPixmap(qimg)
 
-    def update_captured_photo(self, filepath):
-        pixmap = QPixmap(filepath)
-        pixmap = pixmap.scaled(320, 240, Qt.KeepAspectRatio)
-        self.capture_label.setPixmap(pixmap)
+    def update_captured_photo(self, data, score):
+        if isinstance(data, str):  # Auto Save ON
+            pixmap = QPixmap(data).scaled(640,480,Qt.KeepAspectRatio)
+            self.capture_label.setPixmap(pixmap)
+            self.pending_frame = None
+            self.pending_score = None
+        else:  # Auto Save OFF
+            self.pending_frame = data
+            self.pending_score = score
+
+            # 점수 오버레이
+            overlay = data.copy()
+            text = f"😊 {int(score*100)}%"
+            cv2.putText(overlay, text, (10,30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (255,255,255), 2, cv2.LINE_AA)
+            qpix = self.convert_cv_qt(overlay).scaled(640,480,Qt.KeepAspectRatio)
+            self.capture_label.setPixmap(qpix)
+
+    def save_preview(self):
+        if self.pending_frame is not None and self.pending_score is not None:
+            filename = save_smile_photo(self.pending_frame, self.pending_score)
+            print(f"Saved: {filename}")
+            self.pending_frame = None
+            self.pending_score = None
+
+    def cancel_preview(self):
+        self.capture_label.setText("No preview")
+        self.pending_frame = None
+        self.pending_score = None
 
     def manual_capture(self):
-        frame = self.thread.change_pixmap_signal  # 마지막 프레임 접근 방법에 따라 조정 가능
-        # 여기서는 스레드 내부에서 emit된 frame 저장하는 방식 필요
-        # 예제에서는 생략, 필요시 frame 저장 변수 추가
+        if self.thread._run_flag:
+            frame = self.thread.change_pixmap_signal  # 참고: 필요 시 마지막 프레임 변수로 저장
+            # 간단히 OFF 모드와 동일하게 처리 가능
+            pass
 
     def toggle_landmarks(self):
         self.thread.show_landmarks = not self.thread.show_landmarks
+
+    def toggle_auto_save(self):
+        self.thread.auto_save = not self.thread.auto_save
+        status = "ON" if self.thread.auto_save else "OFF"
+        self.btn_auto.setText(f"Auto Save: {status}")
+
+        # Save / Cancel 버튼 표시 여부
+        show_buttons = not self.thread.auto_save
+        self.btn_save.setVisible(show_buttons)
+        self.btn_cancel.setVisible(show_buttons)
 
     def update_threshold(self, value):
         self.thread.SMILE_THRESHOLD = value / 100.0
@@ -205,7 +296,7 @@ class SmileDetectionApp(QMainWindow):
     def convert_cv_qt(frame):
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
+        bytes_per_line = ch*w
         qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg)
 
